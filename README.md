@@ -1,2 +1,25 @@
-# kv_offloading
-[SparseKvPlan](sparse_kv_plan/README.md) 为 Ascend950 上的有序 TopK 分配 KV 缓存槽并生成缺失 KV 的搬运描述符。
+# KV Offloading
+
+本仓库包含面向 Ascend 950 的 **SparseKvPlan** 算子，源码位于 `sparse_kv_plan/`。它在稀疏注意力执行前，根据本轮选中的 token 和当前设备缓存状态，决定哪些 KV 可以直接复用、哪些需要调入，以及它们对应的设备缓存槽位。
+
+## 为什么需要它
+
+推理时会缓存每个历史 token 的键和值（KV），供后续注意力计算复用。上下文越长，这些数据占用的内存越多，而稀疏注意力每轮只访问 Indexer 选出的少量 token。KV 卸载把历史 KV 保存在主机内存，在设备 HBM 上维持容量有限的缓存。相邻轮次选中的 token 往往有重合，Plan 会复用仍在缓存中的 KV，只为缺失项安排搬运。
+
+## 它在链路中的位置
+
+```text
+Indexer：选出本轮要访问的 token，按逻辑位置升序输出
+    ↓
+SparseKvPlan：查缓存，分配槽位，生成搬运清单，并更新缓存记录
+    ↓
+Transfer：按清单把缺失的 KV 搬到指定槽位
+    ↓
+稀疏注意力：按 Plan 给出的槽位读取 KV
+```
+
+例如，本轮需要 token **7、12、21**，其中 **7 和 21** 已在设备缓存中。Plan 会沿用这两个 token 的槽位，为 **12** 分配一个槽位，并给 Transfer 生成一条搬运记录。若同一请求的多条 query 都选中了 **12**，联合规划会让它们共用这个槽位。
+
+Plan 接收按 **token 在上下文中的逻辑位置**升序排列的 TopK。这个顺序让同一请求的多条 TopK 可以直接归并去重，因此上游可以用保序 QLI V1 提供输入。
+
+当前版本支持 MTP0／1／3、TopK 2048 和最长 1,048,576 个 token 的上下文。接口、构建与验证方法见 [SparseKvPlan 使用说明](sparse_kv_plan/README.md)。
